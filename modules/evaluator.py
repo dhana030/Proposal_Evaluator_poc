@@ -1,7 +1,7 @@
 import pandas as pd
 import numpy as np
 import os
-from typing import Dict
+from typing import Dict, List, Any
 from pymilvus import Collection, connections
 from dotenv import load_dotenv
 
@@ -26,9 +26,10 @@ def get_milvus_collection() -> Collection:
         print(f"❌ Failed to connect to or load Milvus collection: {e}")
         return None
 
-def retrieve_context(milvus_collection: Collection, criterion_text: str, k_chunks: int = 5) -> Dict[str, str]:
+def retrieve_context(milvus_collection: Collection, criterion_text: str, k_chunks: int = 5) -> Dict[str, Any]:
     """
-    Embeds the criterion and retrieves the top K relevant chunks from ALL proposals.
+    Embeds the criterion and retrieves up to the top K relevant chunks per proposal.
+    Returns both concatenated context strings and chunk metadata for references.
     """
     print(f"  - ⏳ Embedding criterion: '{criterion_text[:50]}...'")
     # 1. Embed the criterion
@@ -37,7 +38,10 @@ def retrieve_context(milvus_collection: Collection, criterion_text: str, k_chunk
         query_vector = embeddings[0]
     except Exception as e:
         print(f"  - ❌ Jina embedding failed: {e}")
-        return {"Prop_1": "", "Prop_2": ""}
+        return {
+            "Prop_1": {"text": "", "chunks": []},
+            "Prop_2": {"text": "", "chunks": []},
+        }
 
     # 2. Search Milvus
     print(f"  - ⏳ Searching Milvus for relevant chunks...")
@@ -48,40 +52,70 @@ def retrieve_context(milvus_collection: Collection, criterion_text: str, k_chunk
         data=[query_vector], 
         anns_field="embedding", 
         param=search_params, 
-        limit=k_chunks * 2, # Retrieve more to ensure we get chunks from both
+        # Retrieve more overall, then cap per proposal
+        limit=max(k_chunks * 6, 10),
         output_fields=["proposal_id", "text_content", "page_number"]
     )
 
-    # 3. Aggregate context by proposal
-    context_map = {"Prop_1": [], "Prop_2": []}
+    # 3. Aggregate hits by proposal and retain distance to rank
+    hits_by_proposal: Dict[str, List[Dict[str, Any]]] = {"Prop_1": [], "Prop_2": []}
     
     for hit in results[0]:
         proposal_id = hit.entity.get('proposal_id')
         text = hit.entity.get('text_content')
+        page_number = hit.entity.get('page_number')
+        distance = getattr(hit, "distance", None)  # for COSINE, lower is better
         
-        if proposal_id in context_map:
-            # Add to the context list for the relevant proposal
-            context_map[proposal_id].append(text)
+        if proposal_id in hits_by_proposal:
+            hits_by_proposal[proposal_id].append({
+                "proposal_id": proposal_id,
+                "page_number": int(page_number) if page_number is not None else None,
+                "text": text,
+                "distance": float(distance) if distance is not None else None
+            })
     
-    # 4. Concatenate and return the unique context for each proposal
-    final_context = {
-        p_id: "\n---\n".join(list(dict.fromkeys(chunks)))
-        for p_id, chunks in context_map.items()
-    }
+    # 4. For each proposal: sort by similarity, dedupe by text, cap at k_chunks
+    final_context: Dict[str, Dict[str, Any]] = {}
+    for p_id, items in hits_by_proposal.items():
+        # Sort by distance (None last)
+        items_sorted = sorted(
+            items,
+            key=lambda x: (x["distance"] is None, x["distance"] if x["distance"] is not None else 1e9)
+        )
+        seen_texts = set()
+        topk: List[Dict[str, Any]] = []
+        for it in items_sorted:
+            txt = it.get("text", "")
+            if txt in seen_texts:
+                continue
+            seen_texts.add(txt)
+            # Drop distance from public references (keep if needed for debugging)
+            topk.append({k: v for k, v in it.items() if k != "distance"})
+            if len(topk) >= k_chunks:
+                break
+        final_context[p_id] = {
+            "text": "\n---\n".join([c["text"] for c in topk]),
+            "chunks": topk
+        }
     print(f"  - ✅ Retrieved context from Prop_1 and Prop_2.")
     return final_context
 
-def run_evaluation_loop(rubric_df: pd.DataFrame, num_proposals: int) -> pd.DataFrame:
+def run_evaluation_loop(rubric_df: pd.DataFrame, num_proposals: int, output_dir: str = "outputs") -> pd.DataFrame:
     """
     Iterates through each criterion, retrieves context, and scores proposals.
+    
+    Args:
+        rubric_df: DataFrame with evaluation criteria
+        num_proposals: Number of proposals being evaluated
+        output_dir: Directory to save output files (default: "outputs")
     """
     milvus_collection = get_milvus_collection()
     if milvus_collection is None:
         return pd.DataFrame()
 
     final_evaluation_results = []
-    # Ensure output dir for Kimi scoring artifacts
-    artifacts_dir = os.path.join("outputs", "kimi_scores")
+    # Ensure output dir for Kimi scoring artifacts (within the timestamped folder)
+    artifacts_dir = os.path.join(output_dir, "kimi_scores")
     os.makedirs(artifacts_dir, exist_ok=True)
 
     for index, row in rubric_df.iterrows():
@@ -93,16 +127,33 @@ def run_evaluation_loop(rubric_df: pd.DataFrame, num_proposals: int) -> pd.DataF
         # 1. Retrieval (RAG)
         context = retrieve_context(milvus_collection, criterion_text=f"{criterion}. {rubric}")
         
-        context_p1 = context.get('Prop_1', "No relevant content found.")
-        context_p2 = context.get('Prop_2', "No relevant content found.")
+        context_p1_text = context.get('Prop_1', {}).get('text', "No relevant content found.")
+        context_p2_text = context.get('Prop_2', {}).get('text', "No relevant content found.")
+
+        # Save references (retrieved chunk metadata) for this criterion
+        references_dir = os.path.join(output_dir, "references")
+        os.makedirs(references_dir, exist_ok=True)
+        safe_name = f"{index:03d}_" + "".join(c if c.isalnum() or c in (" ", "-", "_") else "_" for c in criterion)[:120]
+        references_path = os.path.join(references_dir, f"{safe_name}.json")
+        try:
+            import json
+            with open(references_path, "w", encoding="utf-8") as rf:
+                json.dump({
+                    "criterion": criterion,
+                    "rubric": rubric,
+                    "Prop_1": context.get('Prop_1', {}).get('chunks', []),
+                    "Prop_2": context.get('Prop_2', {}).get('chunks', [])
+                }, rf, ensure_ascii=False, indent=2)
+        except Exception as _:
+            references_path = ""
         
         # 2. Generation (Kimi Scoring)
         print("  - ⏳ Sending context to Kimi for scoring...")
         scoring_table_markdown = score_proposals_with_rag(
             criterion=criterion,
             rubric=rubric,
-            proposal_1_context=context_p1,
-            proposal_2_context=context_p2,
+            proposal_1_context=context_p1_text,
+            proposal_2_context=context_p2_text,
             num_proposals=num_proposals
         )
 
@@ -110,7 +161,6 @@ def run_evaluation_loop(rubric_df: pd.DataFrame, num_proposals: int) -> pd.DataF
         if scoring_table_markdown:
             print("  - ✅ Kimi scoring complete. Parsing results...")
             # Save raw Kimi markdown for auditing
-            safe_name = f"{index:03d}_" + "".join(c if c.isalnum() or c in (" ", "-", "_") else "_" for c in criterion)[:120]
             try:
                 with open(os.path.join(artifacts_dir, f"{safe_name}.md"), "w", encoding="utf-8") as f:
                     f.write(scoring_table_markdown)
@@ -163,7 +213,8 @@ def run_evaluation_loop(rubric_df: pd.DataFrame, num_proposals: int) -> pd.DataF
                         'Proposal': normalized_proposal,
                         'Score (0-5)': score,
                         'Reasoning (Arabic)': reason_ar,
-                        'Reasoning (English)': reason_en
+                        'Reasoning (English)': reason_en,
+                        'References_File': references_path
                     })
             except Exception as e:
                 print(f"  - ❌ Failed to parse Kimi scoring table: {e}")

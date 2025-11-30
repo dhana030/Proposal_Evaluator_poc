@@ -39,20 +39,40 @@ async def upload_and_evaluate(
                 f.write(content)
         
         # Run the full evaluation pipeline with request-specific params
-        df, output_path = main(
+        result = main(
             rfp_path=rfp_path,
             proposals_paths=proposals_paths,
             rfp_page_number=rfp_page_number
         )
 
+        if result is None:
+            raise HTTPException(status_code=500, detail="Evaluation pipeline failed or returned no results.")
+        
+        df, output_path = result
         if df is None or df.empty:
             raise HTTPException(status_code=500, detail="Evaluation pipeline produced no results.")
+
+        # Extract output directory from output_path
+        output_dir = os.path.dirname(output_path)
+
+        # Attempt to load raw_results.json for UI references
+        raw_results_path = os.path.join(output_dir, "raw_results.json")
+        raw_results = []
+        try:
+            if os.path.exists(raw_results_path):
+                import json as _json
+                with open(raw_results_path, "r", encoding="utf-8") as jf:
+                    raw_results = _json.load(jf)
+        except Exception as _:
+            raw_results = []
 
         # Convert DataFrame to JSON for API response
         return JSONResponse(content={
             "status": "success",
+            "output_directory": output_dir,
             "output_path": output_path,
-            "results": df.to_dict(orient="records")
+            "results": df.to_dict(orient="records"),
+            "raw_results": raw_results
         })
 
     except Exception as e:

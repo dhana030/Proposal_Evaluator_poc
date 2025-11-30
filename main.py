@@ -1,6 +1,7 @@
 import os
 import fitz 
 import pandas as pd
+from datetime import datetime
 from dotenv import load_dotenv
 
 # Import modules
@@ -18,10 +19,14 @@ PROPOSALS_PATHS = {
     "Prop_2": "data/proposal2.pdf"
 }
 RFP_PAGE_NUMBER = 5 # Default page number
-OUTPUT_DIR = "outputs"
+OUTPUT_BASE_DIR = "outputs"
 
 def main(rfp_path: str = RFP_PATH, proposals_paths: dict = PROPOSALS_PATHS, rfp_page_number: int = RFP_PAGE_NUMBER):
+    # Create timestamped output directory for this run
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    OUTPUT_DIR = os.path.join(OUTPUT_BASE_DIR, timestamp)
     os.makedirs(OUTPUT_DIR, exist_ok=True)
+    print(f"📁 Output directory created: {OUTPUT_DIR}")
     
     # --------------------------------
     # 1. RFP Rubric Creation (Your existing, slightly refactored logic)
@@ -74,12 +79,24 @@ def main(rfp_path: str = RFP_PATH, proposals_paths: dict = PROPOSALS_PATHS, rfp_
     # --------------------------------
     print("\n\n--- Step 3: Running RAG Evaluation Loop ---")
     
-    final_scores_df = run_evaluation_loop(rubric_df, num_proposals=len(proposals_paths))
+    final_scores_df = run_evaluation_loop(rubric_df, num_proposals=len(proposals_paths), output_dir=OUTPUT_DIR)
     
     if final_scores_df.empty:
         print("🔴 WARNING: No final scores were generated.")
         return
-    
+    # Also save raw, long-form results for downstream UIs (includes References_File paths)
+    try:
+        raw_csv_path = os.path.join(OUTPUT_DIR, "raw_results.csv")
+        raw_json_path = os.path.join(OUTPUT_DIR, "raw_results.json")
+        final_scores_df.to_csv(raw_csv_path, index=False, encoding="utf-8")
+        # Save JSON preserving non-ASCII
+        import json
+        with open(raw_json_path, "w", encoding="utf-8") as jf:
+            json.dump(final_scores_df.to_dict(orient="records"), jf, ensure_ascii=False, indent=2)
+        print(f"📝 Saved raw results to: {raw_csv_path} and {raw_json_path}")
+    except Exception as e:
+        print(f"🔴 WARNING: Failed to save raw results: {e}")
+
     # --------------------------------
     # 4. Final Output and Presentation
     # --------------------------------
@@ -125,7 +142,10 @@ def main(rfp_path: str = RFP_PATH, proposals_paths: dict = PROPOSALS_PATHS, rfp_
     output_path = os.path.join(OUTPUT_DIR, f"evaluation_results_page_{rfp_page_number}.xlsx")
     pivot_df.to_excel(output_path, index=False)
     
-    print(f"🎉 SUCCESS! Final evaluation results saved to: {output_path}")
+    print(f"\n🎉 SUCCESS! All evaluation results saved to: {OUTPUT_DIR}")
+    print(f"   - Rubric: {os.path.join(OUTPUT_DIR, 'rfp_rubric_raw.md')}")
+    print(f"   - Excel Results: {output_path}")
+    print(f"   - Kimi Scores: {os.path.join(OUTPUT_DIR, 'kimi_scores')}")
     return pivot_df, output_path
 
 if __name__ == "__main__":

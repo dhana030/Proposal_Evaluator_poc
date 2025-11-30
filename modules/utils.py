@@ -59,32 +59,76 @@ def extract_criteria_from_rubric(markdown_table: str) -> pd.DataFrame:
     This DataFrame is used to drive the evaluation loop.
     """
     try:
-        # Simple extraction logic for markdown tables
-        lines = markdown_table.strip().split('\n')
-        # Find header line (usually the third line in a standard markdown table)
+        # Robust parsing logic for markdown tables that may contain blank cells
+        lines = [ln for ln in markdown_table.strip().split('\n') if ln.strip()]
         if len(lines) < 3:
             raise ValueError("Table is too short to be a markdown table.")
 
-        header_line = lines[0]
-        # Clean up column names by removing surrounding pipes and excessive spaces
-        columns = [col.strip() for col in header_line.split('|') if col.strip()]
-        
+        # Find header and separator lines
+        header_idx = next((i for i, ln in enumerate(lines) if ln.strip().startswith('|')), None)
+        sep_idx = None
+        if header_idx is not None:
+            for j in range(header_idx + 1, min(header_idx + 4, len(lines))):
+                if set(lines[j].replace('|', '').strip()) <= set('-: '):
+                    sep_idx = j
+                    break
+        if header_idx is None or sep_idx is None:
+            raise ValueError("Markdown table header/separator not found")
+
+        # Parse header (keep empty columns)
+        raw_header_cells = [c.strip() for c in lines[header_idx].split('|')]
+        # remove table border empties (first and last are empty because of leading/trailing pipes)
+        columns = raw_header_cells[1:-1]
+
+        # Parse rows; keep empty cells and pad/truncate to match columns
         data = []
-        # Start reading data after the header and separator lines
-        for line in lines[2:]: 
-            if line.strip().startswith('|') and line.strip().endswith('|'):
-                values = [val.strip() for val in line.split('|') if val.strip()]
-                if len(values) == len(columns):
-                    data.append(values)
-        
+        for ln in lines[sep_idx + 1:]:
+            if not ln.strip().startswith('|'):
+                # Stop when the table ends
+                break
+            cells = [c.strip() for c in ln.split('|')][1:-1]
+            if len(cells) < len(columns):
+                cells = cells + [''] * (len(columns) - len(cells))
+            elif len(cells) > len(columns):
+                cells = cells[:len(columns)]
+            data.append(cells)
+
+        if not data:
+            return pd.DataFrame()
+
         df = pd.DataFrame(data, columns=columns)
-        # Select and rename the critical columns for the evaluation loop
-        df = df.rename(columns={
+
+        # Forward-fill Main/Weight columns in case Kimi leaves them blank for subsequent sub-rows
+        main_col_candidates = [
+            'Main Criterion (with English translation in brackets)',
+            'Main Criterion',
+        ]
+        for col in main_col_candidates:
+            if col in df.columns:
+                df[col] = df[col].replace('', pd.NA).ffill()
+                break
+
+        # Normalize/rename columns used by the evaluation loop
+        rename_map = {
             'Main Criterion (with English translation in brackets)': 'Main_Criterion',
+            'Main Criterion': 'Main_Criterion',
             'Sub-Criterion (with English translation in brackets)': 'Sub_Criterion',
-            'Expectation / Evaluation Rubric': 'Rubric'
-        })
-        return df[['Main_Criterion', 'Sub_Criterion', 'Rubric']].dropna()
+            'Sub-Criterion': 'Sub_Criterion',
+            'Expectation / Evaluation Rubric': 'Rubric',
+            'Expectation': 'Rubric',
+            'Evaluation Rubric': 'Rubric',
+        }
+        df = df.rename(columns=rename_map)
+
+        # Keep only necessary columns; do not drop rows just because some fields were blank before ffill
+        needed_cols = [c for c in ['Main_Criterion', 'Sub_Criterion', 'Rubric'] if c in df.columns]
+        df = df[needed_cols]
+
+        # Drop rows that truly cannot be evaluated (missing sub-criterion or rubric)
+        df = df.dropna(subset=[c for c in ['Sub_Criterion', 'Rubric'] if c in df.columns])
+        df = df[(df['Sub_Criterion'].astype(str).str.strip() != '') & (df['Rubric'].astype(str).str.strip() != '')]
+
+        return df
     
     except Exception as e:
         print(f"Error parsing Kimi output table: {e}")
